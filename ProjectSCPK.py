@@ -15,6 +15,7 @@ SKALA    = {
     "9 – Mutlak lebih penting":9,
     "1/3":1/3, "1/5":1/5, "1/7":1/7, "1/9":1/9,
 }
+
 @st.cache_data
 def load():
     df = pd.read_csv(CSV_PATH, low_memory=False)
@@ -35,10 +36,22 @@ def load():
     if rename:
         df = df.rename(columns=rename)
 
+    # Deteksi kolom tanggal
+    date_col = None
+    for c in df.columns:
+        if "date" in c.lower() or "tanggal" in c.lower():
+            date_col = c
+            break
+    if date_col:
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df = df.rename(columns={date_col: "Date"})
+
     num_cols = ["Previous","Change","Value","Volume","Frequency","High","Low"]
     df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
 
-    agg = df.groupby(["Stock Code","Company Name"], as_index=False)[num_cols].mean()
+    # Agregasi groupby Stock Code saja, ambil nama terakhir
+    agg = df.groupby("Stock Code", as_index=False)[num_cols].mean()
+    agg["Company Name"] = df.groupby("Stock Code")["Company Name"].last().values
     agg["Return"]      = np.where(agg["Previous"]>0, agg["Change"]/agg["Previous"]*100, 0)
     agg["Likuiditas"]  = agg["Value"]
     agg["Frekuensi"]   = agg["Frequency"]
@@ -70,29 +83,34 @@ def skoring(df, bobot, top_n):
     return d.sort_values("Skor", ascending=False).head(top_n).reset_index(drop=True)
 #endregion
 
-st.sidebar.title("SPK Saham AHP")
+st.sidebar.title("SCPK Saham dengan AHP")
 st.sidebar.caption(f"`{CSV_PATH}`")
 hal = st.sidebar.radio("Menu", ["Data","Hitung AHP","Hasil","Profil Kelompok"])
 
 #region Page 1
 if hal == "Data":
-    st.title("Dataset IDX Stock Summary 2020–2024")
-    st.markdown(f"Total record: {len(df_raw):,} &nbsp;|&nbsp; Emiten unik: {len(df_agg):,}")
+    st.title("Pemilihan Saham Terbaik dengan Metode AHP")
 
     tab1, tab2 = st.tabs(["Data Mentah","Data Agregasi per Saham"])
     with tab1:
-        cari = st.text_input("Cari kode/nama saham", placeholder="Contoh: BBCA")
-        mask = (
-            df_raw["Stock Code"].astype(str).str.upper().str.contains(cari.upper(), na=False) |
-            df_raw["Company Name"].astype(str).str.contains(cari, case=False, na=False)
-        ) if cari else slice(None)
-        tampil = df_raw[mask].head(10_000)
-        st.dataframe(tampil, use_container_width=True, height=500, hide_index=True)
-        st.caption(f"Menampilkan {len(tampil):,} baris.")
+        # Filter tahun
+        if "Date" in df_raw.columns:
+            tahun_list = sorted(df_raw["Date"].dt.year.dropna().unique().astype(int))
+            tahun = st.selectbox("Pilih Tahun", ["Semua"] + tahun_list)
+            if tahun != "Semua":
+                tampil = df_raw[df_raw["Date"].dt.year == tahun]
+            else:
+                tampil = df_raw
+        else:
+            tampil = df_raw
+
+        st.caption(f"Total: {len(df_raw):,} baris keseluruhan | Ditampilkan: {min(len(tampil), 10_000):,} baris")
+        st.dataframe(tampil.head(10_000), use_container_width=True, height=500, hide_index=True)
 
     with tab2:
         view = df_agg[["Stock Code","Company Name","Return","Likuiditas","Volume","Frekuensi","Volatilitas"]].copy()
         view.columns = ["Kode","Perusahaan","Return (%)","Nilai Transaksi","Volume","Frekuensi","Volatilitas"]
+        st.caption(f"Total emiten: {len(view):,}")
         st.dataframe(
             view.style.format({"Return (%)":"{:.2f}%","Nilai Transaksi":"{:,.0f}",
                                "Volume":"{:,.0f}","Frekuensi":"{:,.0f}","Volatilitas":"{:,.1f}"}),
@@ -104,11 +122,9 @@ if hal == "Data":
 elif hal == "Hitung AHP":
     st.title("Perhitungan AHP")
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     top_n   = c1.slider("Jumlah saham terbaik", 5, 30, 10)
     min_val = c2.number_input("Min. Nilai Transaksi (Juta)", 0, 500_000, 1_000, 500)
-    huruf   = c3.selectbox("Filter huruf awal kode",
-                           ["Semua"] + sorted(df_agg["Stock Code"].str[0].dropna().unique()))
 
     st.markdown("---")
     st.subheader("Matriks Perbandingan Berpasangan")
@@ -127,26 +143,26 @@ elif hal == "Hitung AHP":
     if st.button("Jalankan Perhitungan AHP", type="primary", use_container_width=True):
         pv, lmx, ci, cr, nm = hitung_ahp(pcm)
 
-        st.subheader("Langkah 1 — Matriks Ternormalisasi & Priority Vector")
+        st.subheader("Langkah 1 Matriks Ternormalisasi & Priority Vector")
         df_nm = pd.DataFrame(nm, index=KRITERIA, columns=KRITERIA)
         df_nm["Priority Vector"] = pv
         st.dataframe(df_nm.style.format("{:.4f}"), use_container_width=True)
 
-        st.subheader("Langkah 2 — Uji Konsistensi")
+        st.subheader("Langkah 2 Uji Konsistensi")
         for label, val in zip(["λ_max","CI","RI","CR"], [lmx, ci, RI[n], cr]):
             st.columns(4)[["λ_max","CI","RI","CR"].index(label)].metric(label, val)
         if cr > 0.1:
             st.error(f"CR = {cr} > 0.10 — TIDAK KONSISTEN. Revisi perbandingan!"); st.stop()
         st.success(f"CR = {cr} ≤ 0.10 — Matriks KONSISTEN.")
 
-        st.subheader("Langkah 3 — Bobot Kriteria")
+        st.subheader("Langkah 3 Bobot Kriteria")
         df_bobot = pd.DataFrame({"Kriteria":KRITERIA,"Bobot":pv,"Bobot (%)":pv*100})
+        df_bobot.index = range(1, len(df_bobot) + 1)
         st.dataframe(df_bobot.style.format({"Bobot":"{:.4f}","Bobot (%)":"{:.2f}%"}),
                      use_container_width=True)
 
-        st.subheader("Langkah 4 — Skoring & Perangkingan")
-        dfw = df_agg[df_agg["Stock Code"].str.startswith(huruf)].copy() if huruf != "Semua" else df_agg.copy()
-        dfw = dfw[dfw["Likuiditas"] >= min_val * 1_000_000]
+        st.subheader("Langkah 4 Skoring & Perangkingan")
+        dfw = df_agg[df_agg["Likuiditas"] >= min_val * 1_000_000].copy()
         if dfw.empty:
             st.warning("Tidak ada saham memenuhi filter. Longgarkan filter."); st.stop()
 
@@ -166,8 +182,8 @@ elif hal == "Hasil":
     if not st.session_state.get("done"):
         st.error("Belum ada hasil. Jalankan perhitungan di halaman Hitung AHP dulu."); st.stop()
 
-    hasil    = st.session_state["hasil"]
-    cr       = st.session_state["cr"]
+    hasil = st.session_state["hasil"]
+    cr    = st.session_state["cr"]
 
     c1,c2,c3 = st.columns(3)
     c1.metric("Saham Terbaik",     hasil.iloc[0]["Stock Code"])
@@ -181,8 +197,8 @@ elif hal == "Hasil":
     disp.columns = ["#","Kode","Perusahaan","Return (%)","Nilai Transaksi",
                     "Volume","Frekuensi","Volatilitas","Skor AHP"]
 
-    WARNA = {1:"background-color:#50C878", 2:"background-color:#36AA5D",
-             3:"background-color:#7BD599"}
+    WARNA = {1:"background-color:#36AA5D", 2:"background-color:#1565C0",
+             3:"background-color:#FF6F00"}
     def warna_baris(row):
         return [WARNA.get(int(row.name), "")] * len(row)
 
@@ -197,7 +213,7 @@ elif hal == "Hasil":
 
     st.markdown("---")
     st.subheader("Grafik Skor AHP")
-    COLORS = ["#50C878","#36AA5D","#7BD599"] + ["#D8F5DD"] * len(hasil)
+    COLORS = ["#36AA5D","#1565C0","#FF6F00"] + ["#FF817A"] * len(hasil)
     rev    = hasil.iloc[::-1].reset_index(drop=True)
 
     fig, ax = plt.subplots(figsize=(10, max(5, len(rev)*0.65 + 1.5)))
@@ -219,7 +235,7 @@ elif hal == "Hasil":
 #region Page 4
 elif hal == "Profil Kelompok":
     st.title("Profil Kelompok")
-    st.info("Mata Kuliah:Praktikum SCPK\n"
+    st.info("Mata Kuliah: Praktikum SCPK\n"
             "\nTopik: Pemilihan Saham Terbaik dengan Metode AHP")
     st.markdown("### Anggota Kelompok")
     st.dataframe(pd.DataFrame({
